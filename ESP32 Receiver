@@ -1,1 +1,300 @@
+/*
+ * Programmed for the TechChallenge SS2019:
+ * This is the code for the receiver of the data connected to the WiFi (more or less the gateway)
+ * 
+ * Coded by Daniel San José Pro & Alvaro Ritter
+ */
 
+#include <SPI.h>
+#include <LoRa.h>
+#include <math.h>
+
+//define the pins used by the transceiver module
+#define ss 5
+#define rst 14
+#define dio0 2
+
+/*
+ * Including Libraries for the WiFi connection and Temperature sensor
+ */
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <HTTPClient.h>
+
+#include "OneWire.h"
+#include "DallasTemperature.h"
+
+WiFiMulti WiFiMulti;
+HTTPClient dweet;
+HTTPClient ask;
+
+//TO DO:
+//1. change ssid with your wifi's name in a String
+//2. change password with your wifi's password in a String
+//3. change the dweet_name to the name of the thing you created
+//4. change apiKeyIn (look for it in the website asksensors.com
+//5. choose the average behaviours of the cow (temperature and distance per day)
+
+
+const char* ssid     = "..."; //Wifi SSID
+const char* password = "..."; //Wifi Password
+const char* dweet_name = "...";
+const char* apiKeyIn = "..."; // API Key for AskSensors
+
+#define AVERAGE_DISTANCE 5000
+#define T_AVERAGE 39
+
+// Dweet API host config
+const char* host = "dweet.io";  // API host name
+const char* host2 = "api.asksensors.com";
+const int httpPort = 80;      // port
+const unsigned int writeInterval = 5000;   // write interval (in ms)
+
+int days = 1; //counter for the days 
+
+float distance = 0;
+float longitude = 0;
+float latitude = 0;
+  
+void setup(){
+  
+  // open serial
+  Serial.begin(115200);
+  Serial.println("*****************************************************");
+  Serial.println("********** Program Start : Connect ESP32 to Dweet and AskSensors.");
+  Serial.println("Wait for WiFi... ");
+
+  // connecting to the WiFi network
+  WiFiMulti.addAP(ssid, password);
+  while (WiFiMulti.run() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  } 
+  // connected
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  //initialize Serial Monitor
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("LoRa Receiver");
+
+  //setup LoRa transceiver module
+  LoRa.setPins(ss, rst, dio0);
+
+  //866E6 for Europe
+  while (!LoRa.begin(866E6)) {
+    Serial.println(".");
+    delay(500);
+  }
+  
+  LoRa.setSyncWord(0xEA); //Synch Word for the other module 
+  Serial.println("LoRa Initializing OK!");
+}
+
+
+void loop(){
+  // try to parse packet
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    // received a packet
+    Serial.print("Received packet '");
+
+  String tempValue;
+  String tempValueOutside;
+  String latValue;
+  String longValue;
+
+  float probIll = 200.0; //200 is used to indicate that the measurements didn't worked
+  float probIllDistance = 200.0; 
+  
+    // read packet
+    while (LoRa.available()) {
+      String LoRaData = LoRa.readString();
+      Serial.println(LoRaData); 
+      //ex: 48.267954,11.666490,22.50,23.45
+      int i = 0;
+      while(LoRaData[i] != ','){
+        i++;
+      }
+      latValue = LoRaData.substring(0,i);
+      Serial.println(latValue);
+      i++;
+      while(LoRaData[i] != ','){
+        i++;
+      }
+      longValue = LoRaData.substring(latValue.length()+1,i);
+      Serial.println(longValue);
+      i++;
+      while(LoRaData[i] != ','){
+        i++;
+      }
+      tempValue = LoRaData.substring(latValue.length()+1+longValue.length()+1,i);
+      Serial.println(tempValue);
+      tempValueOutside = LoRaData.substring(i+1,LoRaData.length());
+      Serial.println(tempValueOutside);
+    }
+
+  // Use WiFiClient class to create TCP connections
+  WiFiClient client;
+
+  if (!client.connect(host, httpPort)) {
+    Serial.println("connection with dweet failed");
+    return;
+  }else {
+
+    // Create a URL for updating modules
+  String url = "https://dweet.io/dweet/for/";
+  url += dweet_name;
+
+  //upload dweet temperature module
+  if(tempValue.toFloat() != -127.00 && tempValue.toFloat() != 85.00){ //checks if the reading value had an error
+      url += "?temperature=";
+      url += tempValue.toFloat();
+      float Terror;
+      if(tempValueOutside != "nan"){ //checks if the reading value had an error
+        Terror = 2*(1-tempValueOutside.toFloat()/T_AVERAGE); //approximation (with a factor 2) of the error done by measuring the temperature of the cow
+      }else{ //otherwise assume that Toutside = 25 
+        Terror = 2*(1-25/T_AVERAGE);
+      }
+      //probability function modelized with sigmoid function : P(T) = 100% * 1/(1+exp(-alpha*( T - beta ))) with T = Tmeasured + Terror
+      float alpha = 1.6; //to select the rate of changing from 0 to 1 of the curve
+      float beta = T_AVERAGE + log(190)/alpha; //analytical estimation so that P(T_AVERAGE) = 5 % (Low probability of the cow being sick)
+      probIll = 100/(1+exp(-alpha*(tempValue.toFloat()+Terror-beta)));
+  }
+
+  //upload dweet position modules
+  if(longValue != "0.000000" && latValue != "0.000000"){ //checks if the reading value had an error
+    url += "&long=";
+    url += longValue.toFloat();
+    url += "&lat=";
+    url += latValue.toFloat();
+    if(longitude != 0.0 && latitude != 0.0){ //checks if there are at least to values to calculate the distance
+      distance += distanceSpherical(latitude,longitude,latValue.toFloat(),longValue.toFloat());
+      url += "&distance=";
+      url += distance;
+    }
+    longitude = longValue.toFloat();
+    latitude = latValue.toFloat();
+  }
+
+  if(probIll != 200.0){ //there is no error by the computation
+    url +="&probIll=";
+    url += probIll;
+  }
+
+  //calculates the probabilty of being ill due to the distance done by the cow every day
+  if(millis() > days*1000*60*60*24){ //conversion to milliseconds for a certain number of days
+    days++;
+    //probability function modelized with (opposite) sigmoid function : P(d) = 100% * 1/(1+exp(-alpha*(- d + beta ))) with d : distance walked
+    float alpha = 0.0005; //to select the rate of changing from 0 to 1 of the curve
+    float beta = AVERAGE_DISTANCE + log(190)/alpha; //analytical estimation so that P(AVERAGE_DISTANCE) = 5 % (Low probability of the cow being sick)
+    probIllDistance = 100/(1+exp(-alpha*(-tempValue.toFloat()+beta)));
+    distance = 0;
+    url +="&probIllDistance=";
+    url += probIllDistance;
+  }
+    
+  Serial.print("********** requesting URL: ");
+  Serial.println(url);
+  // send data 
+  dweet.begin(url); //Specify the URL
+  
+  // This will send the request to the server
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" + 
+               "Connection: close\r\n\r\n");
+   
+    //Check for the returning code
+    int httpCode = dweet.GET();          
+ 
+    if (httpCode > 0) { 
+ 
+        String payload = dweet.getString();
+        Serial.println(httpCode);
+        Serial.println(payload);
+      } else {
+      Serial.println("Error on HTTP request");
+    }
+    dweet.end(); //End 
+    Serial.println("********** End ");
+    Serial.println("*****************************************************");
+
+  }
+
+  client.stop();  // stop client
+
+    if (!client.connect(host2, httpPort)) {
+    Serial.println("connection with asksensor failed");
+    return;
+  }else {
+
+    // Create a URL for updating modules on asksensors
+  String url = "http://api.asksensors.com/write/";
+  url += apiKeyIn;
+  if(tempValue.toFloat() != -127.00 && tempValue.toFloat() != 85.00){
+      url += "?module1=";
+      url += tempValue.toFloat();
+  }
+
+  if(longValue != "0.000000" && latValue != "0.000000"){
+    url += "&module2=";
+    url += latValue.toFloat();
+    url += "&module3=";
+    url += longValue.toFloat();
+  }
+  if(probIll != 200.0){ //there is no error by the measurement
+    url +="&module4=";
+    url += probIll;
+  }  
+  url +="&module5=";
+  url += distance;
+
+  if(probIllDistance != 200.0){
+      url += "&module6=";
+      url += probIllDistance;
+  }
+  
+  Serial.print("********** requesting URL for AskSensors: ");
+  Serial.println(url);
+   // send data 
+   ask.begin(url); //Specify the URL
+  
+    //Check for the returning code
+    int httpCode = ask.GET();          
+ 
+    if (httpCode > 0) { 
+ 
+        String payload = ask.getString();
+        Serial.println(httpCode);
+        Serial.println(payload);
+      } else {
+      Serial.println("Error on HTTP request");
+    }
+ 
+    ask.end(); //End 
+    Serial.println("********** End AskSensors");
+    Serial.println("*****************************************************");
+
+  }
+
+  client.stop();  // stop client
+  
+  delay(writeInterval);    // delay
+}
+}
+
+
+/*
+ *  the function calculates the distance between two spherical coordinates for small angles and constant 
+ *  radius to the center 
+ */
+float distanceSpherical(float lat1, float long1, float lat2, float long2){
+  float dlat = (lat2-lat1)*PI/180;
+  float dlong = (long2-long1)*PI/180;
+
+  float R = 6371000.0; // in meters
+
+  return sqrt(R*R*dlat*dlat+R*R*dlong*dlong);
+}
