@@ -1,1 +1,205 @@
+/*
+ * Programmed for the TechChallenge SS2019:
+ * This is the code for the "Box" containing the sensors
+ * 
+ * Coded by Daniel San José Pro & Alvaro Ritter
+ */
 
+
+//Temp sensor outside
+#include "DHT.h"
+#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+
+
+// DHT Sensor
+uint8_t DHTPin = 27;
+
+// Initialize DHT sensor.
+DHT dht(DHTPin, DHTTYPE);
+
+
+//Temp sensor (for the cow)
+#include "OneWire.h"
+#include "DallasTemperature.h"
+
+OneWire oneWire(22);
+DallasTemperature tempSensor(&oneWire);
+
+/*********
+  Modified from the examples of the Arduino LoRa library
+  More resources: https://randomnerdtutorials.com
+*********/
+
+#include <SPI.h>
+#include <LoRa.h>
+
+//define the pins used by the transceiver module
+#define ss 5
+#define rst 14
+#define dio0 2
+
+//time between every message in microseconds
+#define SLEEP_TIME 10000000 //10 10^6 us = 10 s
+
+#include <TinyGPS++.h> // Library über http://arduiniana.org/libraries/tinygpsplus/ downloaden und installieren
+#include <HardwareSerial.h> // sollte bereits mit Arduino IDE installiert sein
+#include "EEPROM.h" // sollte bereits mit Arduino IDE installiert sein
+
+#define EEPROM_SIZE 128
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(1);
+struct GpsDataState_t {
+  double originLat = 0;
+  double originLon = 0;
+  double originAlt = 0;
+  double distMax = 0;
+  double dist = 0;
+  double altMax = -999999;
+  double altMin = 999999;
+  double spdMax = 0;
+  double prevDist = 0;
+};
+GpsDataState_t gpsState = {};
+
+template <class T> int EEPROM_writeAnything(int ee, const T& value)
+{
+  const byte* p = (const byte*)(const void*)&value;
+  int i;
+  for (i = 0; i < sizeof(value); i++)
+    EEPROM.write(ee++, *p++);
+  return i;
+}
+
+template <class T> int EEPROM_readAnything(int ee, T& value)
+{
+  byte* p = (byte*)(void*)&value;
+  int i;
+  for (i = 0; i < sizeof(value); i++)
+    *p++ = EEPROM.read(ee++);
+  return i;
+}
+
+
+
+void setup() {
+  //Temp sensor
+  Serial.begin(115200);
+  delay(100);
+  pinMode(DHTPin, INPUT);
+  dht.begin();
+  tempSensor.begin();
+  
+  /*  GPS Module
+      rxPin: ein RX-Pin z.B. 16
+      txPin: ein RX-Pin z.B. 17
+  */
+  SerialGPS.begin(9600, SERIAL_8N1, 16 ,17);
+  while (!EEPROM.begin(EEPROM_SIZE)) {
+    true;
+  }
+
+  long readValue;
+  EEPROM_readAnything(0, readValue);
+  gpsState.originLat = (double)readValue / 1000000;
+
+  EEPROM_readAnything(4, readValue);
+  gpsState.originLon = (double)readValue / 1000000;
+
+  EEPROM_readAnything(8, readValue);
+  gpsState.originAlt = (double)readValue / 1000000;
+
+  delay(500);
+  //Temp Sensor
+  tempSensor.requestTemperaturesByIndex(0);
+ 
+  Serial.print("Temperature DS18B20: ");
+  Serial.print(tempSensor.getTempCByIndex(0));
+  Serial.println(" C");
+
+  Serial.print("Temperature DHT22 (outside): ");
+  Serial.print(dht.readTemperature());
+  Serial.println(" C");
+
+  //GPS
+  static int p0 = 0;
+
+  // GPS Koordinaten von Modul lesen
+  gpsState.originLat = gps.location.lat();
+  gpsState.originLon = gps.location.lng();
+  gpsState.originAlt = gps.altitude.meters();
+
+  // Aktuelle Position in nichtflüchtigen ESP32-Speicher schreiben
+  long writeValue;
+  writeValue = gpsState.originLat * 1000000;
+  EEPROM_writeAnything(0, writeValue);
+  writeValue = gpsState.originLon * 1000000;
+  EEPROM_writeAnything(4, writeValue);
+  writeValue = gpsState.originAlt * 1000000;
+  EEPROM_writeAnything(8, writeValue);
+  EEPROM.commit(); // erst mit commit() werden die Daten geschrieben
+
+  gpsState.distMax = 0;
+  gpsState.altMax = -999999;
+  gpsState.spdMax = 0;
+  gpsState.altMin = 999999;
+  
+  while (SerialGPS.available() > 0) {
+    gps.encode(SerialGPS.read());
+  }
+
+  if (gps.satellites.value() > 4) {
+    gpsState.dist = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), gpsState.originLat, gpsState.originLon);
+
+    if (gpsState.dist > gpsState.distMax && abs(gpsState.prevDist - gpsState.dist) < 50) {
+      gpsState.distMax = gpsState.dist;
+    }
+    gpsState.prevDist = gpsState.dist;
+
+    if (gps.altitude.meters() > gpsState.altMax) {
+      gpsState.altMax = gps.altitude.meters();
+    }
+
+    if (gps.speed.kmph() > gpsState.spdMax) {
+      gpsState.spdMax = gps.speed.kmph();
+    }
+
+    if (gps.altitude.meters() < gpsState.altMin) {
+      gpsState.altMin = gps.altitude.meters();
+    }
+  }
+
+  delay(500);
+  //initialize Serial Monitor
+  Serial.begin(115200);
+  
+  while (!Serial);
+  Serial.println("LoRa Sender");
+
+  //setup LoRa transceiver module
+  LoRa.setPins(ss, rst, dio0);
+
+  while (!LoRa.begin(866E6)) {
+    Serial.println(".");
+  }
+  
+  LoRa.setSyncWord(0xEA);
+  Serial.println("LoRa Initializing OK!");
+  
+  //Send LoRa packet to receiver
+  LoRa.beginPacket();
+  LoRa.print(gps.location.lat(), 6);
+  LoRa.print(",");
+  LoRa.print(gps.location.lng(), 6);
+  LoRa.print(",");
+  LoRa.print(tempSensor.getTempCByIndex(0)); 
+  LoRa.print(",");
+  LoRa.println(dht.readTemperature()); 
+  LoRa.endPacket();
+
+  esp_sleep_enable_timer_wakeup(SLEEP_TIME);
+  esp_deep_sleep_start();
+}
+
+void loop(){
+  
+}
